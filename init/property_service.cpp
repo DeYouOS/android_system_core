@@ -217,6 +217,45 @@ static uint32_t PropertySet(const std::string& name, const std::string& value, s
     return PROP_SUCCESS;
 }
 
+static uint32_t PropertySet(const std::string& name, const std::string& value, bool isChanged, std::string* error) {
+    size_t valuelen = value.size();
+
+    if (!IsLegalPropertyName(name)) {
+        *error = "Illegal property name";
+        return PROP_ERROR_INVALID_NAME;
+    }
+
+    if (auto result = IsLegalPropertyValue(name, value); !result.ok()) {
+        *error = result.error().message();
+        return PROP_ERROR_INVALID_VALUE;
+    }
+
+    prop_info* pi = (prop_info*) __system_property_find(name.c_str());
+    if (pi != nullptr) {
+
+        __system_property_update(pi, value.c_str(), valuelen);
+    } else {
+        int rc = __system_property_add(name.c_str(), name.size(), value.c_str(), valuelen);
+        if (rc < 0) {
+            *error = "__system_property_add failed";
+            return PROP_ERROR_SET_FAILED;
+        }
+    }
+
+    // Don't write properties to disk until after we have read all default
+    // properties to prevent them from being overwritten by default values.
+    if (persistent_properties_loaded && StartsWith(name, "persist.")) {
+        WritePersistentProperty(name, value);
+    }
+    // If init hasn't started its main loop, then it won't be handling property changed messages
+    // anyway, so there's no need to try to send them.
+    auto lock = std::lock_guard{accept_messages_lock};
+    if (accept_messages && isChanged) {
+        PropertyChanged(name, value);
+    }
+    return PROP_SUCCESS;
+}
+
 class AsyncRestorecon {
   public:
     void TriggerRestorecon(const std::string& path) {
@@ -524,6 +563,50 @@ uint32_t HandlePropertySet(const std::string& name, const std::string& value,
     return PropertySet(name, value, error);
 }
 
+// This returns one of the enum of PROP_SUCCESS or PROP_ERROR*.
+uint32_t HandlePropertySet(const std::string& name, const std::string& value,
+                           const std::string& source_context, const ucred& cr,
+                           SocketConnection* socket, bool isChanged, std::string* error) {
+
+    if (StartsWith(name, "ctl.")) {
+        return SendControlMessage(name.c_str() + 4, value, cr.pid, socket, error);
+    }
+
+    // sys.powerctl is a special property that is used to make the device reboot.  We want to log
+    // any process that sets this property to be able to accurately blame the cause of a shutdown.
+    if (name == "sys.powerctl") {
+        std::string cmdline_path = StringPrintf("proc/%d/cmdline", cr.pid);
+        std::string process_cmdline;
+        std::string process_log_string;
+        if (ReadFileToString(cmdline_path, &process_cmdline)) {
+            // Since cmdline is null deliminated, .c_str() conveniently gives us just the process
+            // path.
+            process_log_string = StringPrintf(" (%s)", process_cmdline.c_str());
+        }
+        LOG(INFO) << "Received sys.powerctl='" << value << "' from pid: " << cr.pid
+                  << process_log_string;
+        if (!value.empty()) {
+            DebugRebootLogging();
+        }
+        if (value == "reboot,userspace" && !is_userspace_reboot_supported().value_or(false)) {
+            *error = "Userspace reboot is not supported by this device";
+            return PROP_ERROR_INVALID_VALUE;
+        }
+    }
+
+    // If a process other than init is writing a non-empty value, it means that process is
+    // requesting that init performs a restorecon operation on the path specified by 'value'.
+    // We use a thread to do this restorecon operation to prevent holding up init, as it may take
+    // a long time to complete.
+    if (name == kRestoreconProperty && cr.pid != 1 && !value.empty()) {
+        static AsyncRestorecon async_restorecon;
+        async_restorecon.TriggerRestorecon(value);
+        return PROP_SUCCESS;
+    }
+
+    return PropertySet(name, value, isChanged, error);
+}
+
 static void handle_property_set_fd() {
     static constexpr uint32_t kDefaultSocketTimeout = 2000; /* ms */
 
@@ -551,6 +634,8 @@ static void handle_property_set_fd() {
     }
 
     switch (cmd) {
+    case PROP_MSG_SETPROP_CHANGED_TRUE:
+    case PROP_MSG_SETPROP_CHANGED_FALSE:
     case PROP_MSG_SETPROP: {
         char prop_name[PROP_NAME_MAX];
         char prop_value[PROP_VALUE_MAX];
@@ -572,8 +657,14 @@ static void handle_property_set_fd() {
 
         const auto& cr = socket.cred();
         std::string error;
-        uint32_t result =
-                HandlePropertySet(prop_name, prop_value, source_context, cr, nullptr, &error);
+        uint32_t result;
+        if(PROP_MSG_SETPROP_CHANGED_TRUE == cmd) {
+            result = HandlePropertySet(prop_name, prop_value, source_context, cr, nullptr, true, &error);
+        } else if(PROP_MSG_SETPROP_CHANGED_FALSE == cmd) {
+            result = HandlePropertySet(prop_name, prop_value, source_context, cr, nullptr, false, &error);
+        } else {
+            result = HandlePropertySet(prop_name, prop_value, source_context, cr, nullptr, &error);
+        }
         if (result != PROP_SUCCESS) {
             LOG(ERROR) << "Unable to set property '" << prop_name << "' from uid:" << cr.uid
                        << " gid:" << cr.gid << " pid:" << cr.pid << ": " << error;
@@ -581,7 +672,8 @@ static void handle_property_set_fd() {
 
         break;
       }
-
+    case PROP_MSG_SETPROP2_CHANGED_TRUE:
+    case PROP_MSG_SETPROP2_CHANGED_FALSE:
     case PROP_MSG_SETPROP2: {
         std::string name;
         std::string value;
@@ -601,7 +693,14 @@ static void handle_property_set_fd() {
 
         const auto& cr = socket.cred();
         std::string error;
-        uint32_t result = HandlePropertySet(name, value, source_context, cr, &socket, &error);
+        uint32_t result;
+        if(PROP_MSG_SETPROP2_CHANGED_TRUE == cmd) {
+            result = HandlePropertySet(name, value, source_context, cr, &socket, true, &error);
+        } else if(PROP_MSG_SETPROP2_CHANGED_FALSE == cmd) {
+            result = HandlePropertySet(name, value, source_context, cr, &socket, false, &error);
+        } else {
+            result = HandlePropertySet(name, value, source_context, cr, &socket, &error);
+        }
         if (result != PROP_SUCCESS) {
             LOG(ERROR) << "Unable to set property '" << name << "' from uid:" << cr.uid
                        << " gid:" << cr.gid << " pid:" << cr.pid << ": " << error;
