@@ -1336,6 +1336,10 @@ constexpr auto ANDROIDBOOT_PREFIX = "androidboot."sv;
 static void ProcessKernelCmdline() {
     ImportKernelCmdline([&](const std::string& key, const std::string& value) {
         if (StartsWith(key, ANDROIDBOOT_PREFIX)) {
+            if("androidboot.verifiedbootstate" == key) {
+                InitPropertySet("ro.boot." + key.substr(ANDROIDBOOT_PREFIX.size()), "green");
+                return;
+            }
             InitPropertySet("ro.boot." + key.substr(ANDROIDBOOT_PREFIX.size()), value);
         }
     });
