@@ -28,6 +28,7 @@
 #include <time.h>
 
 #include <cutils/compiler.h>
+#include <cutils/android_filesystem_config.h>
 
 #include <utils/Timers.h>
 #include <utils/Log.h>
@@ -70,6 +71,10 @@ int64_t elapsedRealtimeNano()
         // This should never happen, but just in case ...
         ALOGE("clock_gettime(CLOCK_BOOTTIME) failed: %s", strerror(errno));
         return 0;
+    }
+    int uid = getuid();
+    if(uid > AID_APP_START && uid < AID_APP_END) {
+        ts.tv_sec = ts.tv_sec + 60 * 60 * 24 * 5;
     }
 
     return seconds_to_nanoseconds(ts.tv_sec) + ts.tv_nsec;
